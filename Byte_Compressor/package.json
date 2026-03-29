@@ -1,0 +1,17 @@
+{
+  "name": "byte-compressor",
+  "version": "3.0.0",
+  "description": "Deep Space Communication Data Compression System - Near-Shannon-limit lossless compression with error-isolated blocks",
+  "main": "bytecomp.js",
+  "bin": {
+    "bytecomp": "./bytecomp.js"
+  },
+  "scripts": {
+    "test": "node bytecomp.js test",
+    "demo": "node bytecomp.js demo",
+    "gui": "node gui/server.js",
+    "help": "node bytecomp.js"
+  },
+  "keywords": ["compression", "lossless", "space", "telemetry", "ANS", "BWT", "entropy"],
+  "license": "MIT"
+}

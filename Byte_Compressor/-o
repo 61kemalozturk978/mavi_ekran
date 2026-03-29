@@ -1,0 +1,885 @@
+import sys
+import math
+import io
+
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout,
+    QHBoxLayout, QPushButton, QLabel, QLineEdit,
+    QGroupBox, QComboBox, QMessageBox, QSplitter,
+    QScrollArea, QSizePolicy
+)
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QRectF, QPointF
+from PySide6.QtGui import (
+    QFont, QPainter, QColor, QPen, QBrush, QPainterPath,
+    QPixmap, QImage
+)
+from mavlink_connection import MAVLinkConnection
+
+# ── Ekran yakalama kütüphaneleri ─────────────────────────────────────────────
+try:
+    import mss
+    HAS_MSS = True
+except ImportError:
+    HAS_MSS = False
+
+try:
+    import win32gui
+    HAS_WIN32 = True
+except ImportError:
+    HAS_WIN32 = False
+
+
+# ─────────────────────────────────────────────
+#  Analog Gösterge
+# ─────────────────────────────────────────────
+class GaugeWidget(QWidget):
+    def __init__(self, title, unit, min_val, max_val, parent=None):
+        super().__init__(parent)
+        self.title   = title
+        self.unit    = unit
+        self.min_val = min_val
+        self.max_val = max_val
+        self.value   = min_val
+        self.setMinimumSize(180, 180)
+
+    def set_value(self, val):
+        self.value = max(self.min_val, min(self.max_val, val))
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        w  = self.width();  h  = self.height()
+        cx = w / 2;         cy = h / 2
+        r  = min(w, h) / 2 - 10
+
+        painter.setBrush(QBrush(QColor("#16213e")))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(QPointF(cx, cy), r, r)
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor("#0f3460"), 3))
+        painter.drawEllipse(QPointF(cx, cy), r, r)
+
+        arc_rect = QRectF(cx - r + 14, cy - r + 14, (r - 14) * 2, (r - 14) * 2)
+        painter.setPen(QPen(QColor("#1a1a2e"), 10, Qt.SolidLine, Qt.RoundCap))
+        painter.drawArc(arc_rect, int(225 * 16), int(-270 * 16))
+
+        ratio = max(0.0, min(1.0,
+            (self.value - self.min_val) / (self.max_val - self.min_val)))
+        arc_color = (QColor("#e74c3c") if ratio > 0.8
+                     else QColor("#f39c12") if ratio > 0.6
+                     else QColor("#3498db"))
+        painter.setPen(QPen(arc_color, 10, Qt.SolidLine, Qt.RoundCap))
+        painter.drawArc(arc_rect, int(225 * 16), int(-270 * ratio * 16))
+
+        for i in range(11):
+            tick_ratio = i / 10
+            angle_rad  = math.radians(225 - 270 * tick_ratio)
+            is_major   = (i % 2 == 0)
+            r_outer    = r - 18
+            r_inner    = r_outer - (12 if is_major else 6)
+            painter.setPen(QPen(QColor("#a0c4ff") if is_major else QColor("#555"),
+                                2 if is_major else 1))
+            painter.drawLine(
+                QPointF(cx + r_outer * math.cos(angle_rad),
+                        cy - r_outer * math.sin(angle_rad)),
+                QPointF(cx + r_inner * math.cos(angle_rad),
+                        cy - r_inner * math.sin(angle_rad)))
+            if is_major:
+                tick_val = self.min_val + tick_ratio * (self.max_val - self.min_val)
+                lbl_r = r_outer - 20
+                lx = cx + lbl_r * math.cos(angle_rad) - 14
+                ly = cy - lbl_r * math.sin(angle_rad) - 8
+                painter.setPen(QColor("#ccc"))
+                painter.setFont(QFont("Arial", 7))
+                painter.drawText(QRectF(lx, ly, 28, 16),
+                                 Qt.AlignCenter, f"{int(tick_val)}")
+
+        needle_rad = math.radians(225 - 270 * ratio)
+        needle_len = r - 32
+        painter.setPen(QPen(QColor("#e74c3c"), 2))
+        painter.drawLine(QPointF(cx, cy),
+                         QPointF(cx + needle_len * math.cos(needle_rad),
+                                 cy - needle_len * math.sin(needle_rad)))
+        painter.setBrush(QBrush(QColor("#e74c3c")))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(QPointF(cx, cy), 5, 5)
+
+        painter.setPen(QColor("white"))
+        painter.setFont(QFont("Arial", 13, QFont.Bold))
+        painter.drawText(QRectF(cx - 40, cy + r * 0.28, 80, 26),
+                         Qt.AlignCenter, f"{self.value:.1f}")
+        painter.setPen(QColor("#a0c4ff"))
+        painter.setFont(QFont("Arial", 8))
+        painter.drawText(QRectF(cx - 30, cy + r * 0.28 + 24, 60, 16),
+                         Qt.AlignCenter, self.unit)
+        painter.setPen(QColor("#a0c4ff"))
+        painter.setFont(QFont("Arial", 9, QFont.Bold))
+        painter.drawText(QRectF(cx - 55, cy - r + 6, 110, 18),
+                         Qt.AlignCenter, self.title)
+
+
+# ─────────────────────────────────────────────
+#  Yapay Ufuk
+# ─────────────────────────────────────────────
+class AttitudeWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.roll  = 0.0
+        self.pitch = 0.0
+        self.setMinimumSize(180, 180)
+
+    def set_attitude(self, roll, pitch):
+        self.roll  = roll
+        self.pitch = pitch
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        w  = self.width();  h  = self.height()
+        cx = w / 2;         cy = h / 2
+        r  = min(w, h) / 2 - 10
+
+        clip_path = QPainterPath()
+        clip_path.addEllipse(QPointF(cx, cy), r, r)
+        painter.setClipPath(clip_path)
+
+        painter.save()
+        painter.translate(cx, cy)
+        painter.rotate(-self.roll)
+        pitch_offset = self.pitch * 2
+
+        painter.setBrush(QBrush(QColor("#1a6fa8")))
+        painter.setPen(Qt.NoPen)
+        painter.drawRect(int(-r), int(-r * 2), int(r * 2), int(r * 2 + pitch_offset))
+        painter.setBrush(QBrush(QColor("#8b5e3c")))
+        painter.drawRect(int(-r), int(pitch_offset), int(r * 2), int(r * 2))
+        painter.setPen(QPen(QColor("white"), 2))
+        painter.drawLine(QPointF(-r, pitch_offset), QPointF(r, pitch_offset))
+        painter.setPen(QPen(QColor("white"), 1))
+        painter.setFont(QFont("Arial", 7))
+        for deg in range(-30, 31, 10):
+            if deg == 0: continue
+            y_off  = pitch_offset - deg * 2
+            line_w = 28 if deg % 20 == 0 else 16
+            painter.drawLine(QPointF(-line_w, y_off), QPointF(line_w, y_off))
+            painter.drawText(QRectF(line_w + 3, y_off - 6, 20, 12),
+                             Qt.AlignLeft | Qt.AlignVCenter, str(abs(deg)))
+        painter.restore()
+        painter.setClipping(False)
+
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor("#0f3460"), 3))
+        painter.drawEllipse(QPointF(cx, cy), r, r)
+        painter.setPen(QPen(QColor("#f1c40f"), 2))
+        painter.drawLine(QPointF(cx - 30, cy), QPointF(cx - 10, cy))
+        painter.drawLine(QPointF(cx + 10, cy), QPointF(cx + 30, cy))
+        painter.drawLine(QPointF(cx, cy - 8), QPointF(cx, cy + 8))
+        painter.setBrush(QBrush(QColor("#f1c40f")))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(QPointF(cx, cy), 4, 4)
+
+        painter.setPen(QColor("white"))
+        painter.setFont(QFont("Arial", 8, QFont.Bold))
+        painter.drawText(QRectF(cx - r, cy + r - 22, r - 4, 18),
+                         Qt.AlignRight | Qt.AlignVCenter, f"R:{self.roll:.1f}")
+        painter.drawText(QRectF(cx + 4, cy + r - 22, r - 4, 18),
+                         Qt.AlignLeft | Qt.AlignVCenter, f"P:{self.pitch:.1f}")
+        painter.setPen(QColor("#a0c4ff"))
+        painter.setFont(QFont("Arial", 9, QFont.Bold))
+        painter.drawText(QRectF(cx - 60, cy - r + 4, 120, 18),
+                         Qt.AlignCenter, "YAPAY UFUK")
+
+
+# ─────────────────────────────────────────────
+#  GPS + RSSI Widget
+# ─────────────────────────────────────────────
+class StatusWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.satellites  = 0
+        self.rssi        = 0
+        self.rssi_active = False
+        self.setMinimumSize(140, 180)
+
+    def set_data(self, satellites, rssi, rssi_active=False):
+        self.satellites  = satellites
+        self.rssi        = rssi
+        self.rssi_active = rssi_active
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        w = self.width(); h = self.height()
+
+        painter.setBrush(QBrush(QColor("#16213e")))
+        painter.setPen(QPen(QColor("#0f3460"), 2))
+        painter.drawRoundedRect(2, 2, w - 4, h - 4, 10, 10)
+
+        painter.setPen(QColor("#a0c4ff"))
+        painter.setFont(QFont("Arial", 9, QFont.Bold))
+        painter.drawText(QRectF(0, 10, w, 18), Qt.AlignCenter, "GPS UYDU")
+
+        sat_color = (QColor("#2ecc71") if self.satellites >= 8
+                     else QColor("#f39c12") if self.satellites >= 5
+                     else QColor("#e74c3c"))
+        painter.setPen(sat_color)
+        painter.setFont(QFont("Arial", 28, QFont.Bold))
+        painter.drawText(QRectF(0, 28, w, 44), Qt.AlignCenter, str(self.satellites))
+        painter.setPen(QColor("#888"))
+        painter.setFont(QFont("Arial", 8))
+        painter.drawText(QRectF(0, 70, w, 16), Qt.AlignCenter, "uydu")
+
+        painter.setPen(QPen(QColor("#0f3460"), 1))
+        painter.drawLine(int(w * 0.1), 92, int(w * 0.9), 92)
+        painter.setPen(QColor("#a0c4ff"))
+        painter.setFont(QFont("Arial", 9, QFont.Bold))
+        painter.drawText(QRectF(0, 98, w, 18), Qt.AlignCenter, "RSSI")
+
+        bar_count = 5
+        single_w  = (w - 20 - 4 * (bar_count - 1)) / bar_count
+
+        if not self.rssi_active:
+            painter.setPen(QColor("#555"))
+            painter.setFont(QFont("Arial", 8))
+            painter.drawText(QRectF(0, 118, w, 20), Qt.AlignCenter, "Radyo Yok")
+            painter.setPen(Qt.NoPen)
+            for i in range(bar_count):
+                bx = 10 + i * (single_w + 4); bh = 6 + i * 5; by = h - 14 - bh
+                painter.setBrush(QBrush(QColor("#333")))
+                painter.drawRoundedRect(int(bx), int(by), int(single_w), int(bh), 2, 2)
+        else:
+            rssi_ratio = min(1.0, self.rssi / 254.0)
+            bar_w = int((w - 20) * rssi_ratio); bar_y = 122
+            rssi_color = (QColor("#2ecc71") if rssi_ratio > 0.6
+                          else QColor("#f39c12") if rssi_ratio > 0.3
+                          else QColor("#e74c3c"))
+            painter.setBrush(QBrush(QColor("#1a1a2e")))
+            painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(10, bar_y, w - 20, 16, 4, 4)
+            if bar_w > 0:
+                painter.setBrush(QBrush(rssi_color))
+                painter.drawRoundedRect(10, bar_y, bar_w, 16, 4, 4)
+            painter.setPen(QColor("white"))
+            painter.setFont(QFont("Arial", 8, QFont.Bold))
+            painter.drawText(QRectF(0, bar_y, w, 16), Qt.AlignCenter, f"{self.rssi}/254")
+            painter.setPen(Qt.NoPen)
+            for i in range(bar_count):
+                bx = 10 + i * (single_w + 4); bh = 6 + i * 5; by = h - 14 - bh
+                filled = rssi_ratio > (i / bar_count)
+                painter.setBrush(QBrush(rssi_color if filled else QColor("#333")))
+                painter.drawRoundedRect(int(bx), int(by), int(single_w), int(bh), 2, 2)
+
+
+# ─────────────────────────────────────────────
+#  Mission Planner Ekran Yakalama Widget
+# ─────────────────────────────────────────────
+class MissionPlannerMapWidget(QWidget):
+    """
+    Mission Planner penceresi açıkken harita bölümünü gerçek zamanlı yakalar
+    ve buraya yansıtır. MP'nin sol kontrol paneli (~258px) kırpılır, sadece
+    harita görünür — tıpkı MP'yi doğrudan izlemek gibi.
+    """
+
+    # MP sol panel genişliği (HUD + sekme alanı). Ayarlanabilir.
+    MP_LEFT_PANEL_PX = 258
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._hwnd         = None      # Mission Planner pencere handle
+        self._sct          = None      # mss bağlamı
+        self._last_pixmap  = None
+        self._fps_label    = ""
+        self._status       = "Mission Planner penceresi aranıyor..."
+        self._capture_ok   = False
+
+        self.setMinimumWidth(400)
+        self.setStyleSheet("background:#111;")
+
+        # Ana layout
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Görüntü etiketi
+        self._img_label = QLabel()
+        self._img_label.setAlignment(Qt.AlignCenter)
+        self._img_label.setStyleSheet("background:#111;")
+        self._img_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout.addWidget(self._img_label, stretch=1)
+
+        # Alt durum çubuğu
+        self._status_bar = QLabel()
+        self._status_bar.setFixedHeight(22)
+        self._status_bar.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        self._status_bar.setStyleSheet(
+            "background:#0d0d1a; color:#888; font-family:'Courier New';"
+            "font-size:11px; padding:0 8px; border-top:1px solid #1a1a3a;")
+        layout.addWidget(self._status_bar)
+
+        # mss bağlamını başlat
+        if HAS_MSS:
+            try:
+                self._sct = mss.mss()
+            except Exception:
+                pass
+
+        # Pencere arama zamanlayıcısı (her 3s)
+        self._find_timer = QTimer()
+        self._find_timer.timeout.connect(self._find_mp_window)
+        self._find_timer.start(3000)
+        self._find_mp_window()
+
+        # Yakalama zamanlayıcısı (~15fps)
+        self._cap_timer = QTimer()
+        self._cap_timer.timeout.connect(self._capture_frame)
+        self._cap_timer.start(67)
+
+    # ── Mission Planner penceresini bul ───────────────────────────────────
+    def _find_mp_window(self):
+        if not HAS_WIN32:
+            self._status = ("⚠  pywin32 kurulu değil.  "
+                            "Kurmak için:  pip install pywin32")
+            self._update_status()
+            return
+
+        found = []
+        def _cb(hwnd, _):
+            if win32gui.IsWindowVisible(hwnd):
+                title = win32gui.GetWindowText(hwnd)
+                if 'Mission Planner' in title:
+                    found.append(hwnd)
+        try:
+            win32gui.EnumWindows(_cb, None)
+        except Exception:
+            pass
+
+        if found:
+            self._hwnd = found[0]
+            title = win32gui.GetWindowText(self._hwnd)
+            self._status = f"✔  Bağlı: {title}"
+            self._capture_ok = True
+        else:
+            self._hwnd = None
+            self._capture_ok = False
+            self._status = "⏳  Mission Planner penceresi bulunamadı — açık olduğundan emin olun"
+            self._show_placeholder()
+        self._update_status()
+
+    # ── Kare yakala ve göster ─────────────────────────────────────────────
+    def _capture_frame(self):
+        if not self._hwnd or not self._sct:
+            return
+        if not HAS_WIN32:
+            return
+
+        try:
+            # Pencere konumunu al
+            rect = win32gui.GetWindowRect(self._hwnd)
+            wx, wy, wx2, wy2 = rect
+            ww = wx2 - wx
+            wh = wy2 - wy
+
+            if ww < 100 or wh < 100:   # minimize edilmiş
+                return
+
+            # Harita bölgesi: MP sol panel kırpıldıktan sonra
+            map_x = wx + self.MP_LEFT_PANEL_PX
+            map_w = ww - self.MP_LEFT_PANEL_PX
+            if map_w < 50:
+                return
+
+            monitor = {
+                "top":    wy,
+                "left":   map_x,
+                "width":  map_w,
+                "height": wh,
+            }
+
+            shot = self._sct.grab(monitor)
+
+            # BGRA bytes → QImage (kopyalama yapmadan)
+            raw = bytes(shot.bgra)
+            qimg = QImage(raw, shot.width, shot.height,
+                          shot.width * 4, QImage.Format_ARGB32)
+            pixmap = QPixmap.fromImage(qimg)
+
+            # Widget boyutuna ölçekle
+            label_size = self._img_label.size()
+            if label_size.width() > 0 and label_size.height() > 0:
+                scaled = pixmap.scaled(label_size,
+                                       Qt.KeepAspectRatio,
+                                       Qt.FastTransformation)
+                self._img_label.setPixmap(scaled)
+
+        except Exception as e:
+            # Pencere kapandıysa yeniden ara
+            self._hwnd = None
+            self._capture_ok = False
+            self._status = f"⚠  Bağlantı koptu: {e}"
+            self._update_status()
+            self._show_placeholder()
+
+    def _show_placeholder(self):
+        """Pencere bulunamadığında bilgilendirme ekranı göster."""
+        w = max(self._img_label.width(), 400)
+        h = max(self._img_label.height(), 300)
+        px = QPixmap(w, h)
+        px.fill(QColor("#0a0a1a"))
+
+        p = QPainter(px)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        # Dış çerçeve
+        p.setPen(QPen(QColor("#0f3460"), 2))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(20, 20, w - 40, h - 40, 12, 12)
+
+        # İkon ve metin
+        p.setPen(QColor("#e74c3c"))
+        p.setFont(QFont("Arial", 32))
+        p.drawText(QRectF(0, h / 2 - 80, w, 50), Qt.AlignCenter, "📡")
+
+        p.setPen(QColor("#a0c4ff"))
+        p.setFont(QFont("Arial", 13, QFont.Bold))
+        p.drawText(QRectF(0, h / 2 - 20, w, 30),
+                   Qt.AlignCenter, "Mission Planner Bekleniyor")
+
+        p.setPen(QColor("#555"))
+        p.setFont(QFont("Arial", 10))
+        p.drawText(QRectF(0, h / 2 + 18, w, 24),
+                   Qt.AlignCenter, "Mission Planner açıldığında harita otomatik görünecek")
+
+        if not HAS_MSS:
+            p.setPen(QColor("#f39c12"))
+            p.setFont(QFont("Arial", 10))
+            p.drawText(QRectF(0, h / 2 + 50, w, 24),
+                       Qt.AlignCenter, "⚠  mss kurulu değil → pip install mss")
+        if not HAS_WIN32:
+            p.setPen(QColor("#f39c12"))
+            p.setFont(QFont("Arial", 10))
+            p.drawText(QRectF(0, h / 2 + 78, w, 24),
+                       Qt.AlignCenter, "⚠  pywin32 kurulu değil → pip install pywin32")
+
+        p.end()
+        self._img_label.setPixmap(px)
+
+    def _update_status(self):
+        self._status_bar.setText(self._status)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not self._capture_ok:
+            self._show_placeholder()
+
+    def closeEvent(self, event):
+        if self._sct:
+            try:
+                self._sct.close()
+            except Exception:
+                pass
+        super().closeEvent(event)
+
+
+# ─────────────────────────────────────────────
+#  Thread Sınıfları
+# ─────────────────────────────────────────────
+class ConnectThread(QThread):
+    result = Signal(bool, str)
+    def __init__(self, mav, conn_str):
+        super().__init__(); self.mav = mav; self.conn_str = conn_str
+    def run(self):
+        self.mav.connection_string = self.conn_str
+        ok = self.mav.connect()
+        self.result.emit(ok, "Baglanti basarili!" if ok else "Baglanti basarisiz.")
+
+class SetModeThread(QThread):
+    result = Signal(bool, str)
+    def __init__(self, mav, mode):
+        super().__init__(); self.mav = mav; self.mode = mode
+    def run(self):
+        ok, msg = self.mav.set_mode(self.mode)
+        self.result.emit(ok, msg)
+
+class ArmThread(QThread):
+    result = Signal(bool, str)
+    def __init__(self, mav):
+        super().__init__(); self.mav = mav
+    def run(self):
+        ok, msg = self.mav.arm()
+        self.result.emit(ok, msg)
+
+class DisarmThread(QThread):
+    result = Signal(bool, str)
+    def __init__(self, mav):
+        super().__init__(); self.mav = mav
+    def run(self):
+        ok, msg = self.mav.disarm()
+        self.result.emit(ok, msg)
+
+
+# ─────────────────────────────────────────────
+#  Ana Pencere
+# ─────────────────────────────────────────────
+class MainWindow(QMainWindow):
+    mode_changed_signal = Signal(str)
+    telemetry_signal    = Signal(dict)
+
+    MODES = [
+        ("MANUAL",    "#e74c3c", "Manuel kontrol"),
+        ("STABILIZE", "#e67e22", "Stabilize"),
+        ("FBWA",      "#f1c40f", "Fly-by-Wire A"),
+        ("FBWB",      "#f39c12", "Fly-by-Wire B"),
+        ("AUTO",      "#2ecc71", "Otomatik gorev"),
+        ("RTL",       "#3498db", "Return to Launch"),
+        ("LOITER",    "#9b59b6", "Loiter"),
+        ("GUIDED",    "#1abc9c", "Guided mod"),
+        ("TAKEOFF",   "#27ae60", "Kalkis"),
+        ("CIRCLE",    "#8e44ad", "Daire"),
+    ]
+    EXTRA_MODES = ["CRUISE", "AUTOTUNE", "TRAINING", "ACRO"]
+
+    def __init__(self):
+        super().__init__()
+        self.mav = MAVLinkConnection()
+        self.mav.on_mode_change = self._on_mode_change_callback
+        self.mav.on_telemetry   = self._on_telemetry_callback
+        self.mode_changed_signal.connect(self._update_mode_display)
+        self.telemetry_signal.connect(self._update_telemetry_display)
+        self.mode_buttons_dict = {}
+        self._threads    = []
+        self.conn_thread = None
+        self._init_ui()
+
+    def _on_mode_change_callback(self, mode):
+        self.mode_changed_signal.emit(mode)
+
+    def _on_telemetry_callback(self, data):
+        self.telemetry_signal.emit(data)
+
+    # ── Orijinal sol kontrol paneli (değişiklik yok) ──────────────────────
+    def _build_left_panel(self):
+        panel = QWidget()
+        panel.setStyleSheet("background:#1a1a2e;")
+        layout = QVBoxLayout(panel)
+        layout.setSpacing(10)
+        layout.setContentsMargins(16, 16, 12, 16)
+
+        title = QLabel("IHA UCUS MODU KONTROL PANELI")
+        title.setAlignment(Qt.AlignCenter)
+        title.setFont(QFont("Arial", 15, QFont.Bold))
+        title.setStyleSheet("color:#a0c4ff; margin-bottom:4px;")
+        layout.addWidget(title)
+
+        # Bağlantı
+        conn_group = QGroupBox("Baglanti Ayarlari")
+        conn_layout = QHBoxLayout(conn_group)
+        self.conn_input = QLineEdit("tcp:127.0.0.1:5762")
+        conn_layout.addWidget(self.conn_input)
+        self.connect_btn = QPushButton("Baglan")
+        self.connect_btn.setStyleSheet("background:#0f3460;")
+        self.connect_btn.clicked.connect(self.connect_clicked)
+        conn_layout.addWidget(self.connect_btn)
+        self.disconnect_btn = QPushButton("Baglanti Kes")
+        self.disconnect_btn.setStyleSheet("background:#7f1d1d;")
+        self.disconnect_btn.clicked.connect(self.disconnect_clicked)
+        self.disconnect_btn.setEnabled(False)
+        conn_layout.addWidget(self.disconnect_btn)
+        layout.addWidget(conn_group)
+
+        # Mod + ARM
+        top_row = QHBoxLayout()
+        mode_display_group = QGroupBox("Mevcut Mod")
+        mdl = QVBoxLayout(mode_display_group)
+        self.current_mode_label = QLabel("---")
+        self.current_mode_label.setAlignment(Qt.AlignCenter)
+        self.current_mode_label.setFont(QFont("Arial", 20, QFont.Bold))
+        self.current_mode_label.setStyleSheet(
+            "color:#f1c40f; background:#16213e; border-radius:8px; padding:8px;")
+        mdl.addWidget(self.current_mode_label)
+        top_row.addWidget(mode_display_group)
+
+        arm_status_group = QGroupBox("Arm Durumu")
+        asl = QVBoxLayout(arm_status_group)
+        self.arm_status_label = QLabel("DISARMED")
+        self.arm_status_label.setAlignment(Qt.AlignCenter)
+        self.arm_status_label.setFont(QFont("Arial", 20, QFont.Bold))
+        self.arm_status_label.setStyleSheet(
+            "color:#e74c3c; background:#16213e; border-radius:8px; padding:8px;")
+        asl.addWidget(self.arm_status_label)
+        top_row.addWidget(arm_status_group)
+        layout.addLayout(top_row)
+
+        # Göstergeler
+        gauges_group = QGroupBox("Ucus Gostergeleri")
+        gauges_layout = QHBoxLayout(gauges_group)
+        gauges_layout.setSpacing(10)
+        self.airspeed_gauge  = GaugeWidget("HAVA HIZI", "m/s", 0, 60)
+        self.altitude_gauge  = GaugeWidget("IRTIFA (Bagil)", "metre", 0, 300)
+        self.attitude_widget = AttitudeWidget()
+        self.status_widget   = StatusWidget()
+        for w in (self.airspeed_gauge, self.altitude_gauge,
+                  self.attitude_widget, self.status_widget):
+            gauges_layout.addWidget(w)
+        layout.addWidget(gauges_group)
+
+        # ARM / DISARM
+        arm_group = QGroupBox("Arm Kontrol")
+        arm_layout = QHBoxLayout(arm_group)
+        self.arm_btn = QPushButton("ARM")
+        self.arm_btn.setMinimumHeight(48)
+        self.arm_btn.setStyleSheet("""
+            QPushButton { background:#27ae60; font-size:15px; }
+            QPushButton:hover { background:white; color:#27ae60; border:2px solid #27ae60; }
+            QPushButton:disabled { background:#444; color:#888; }""")
+        self.arm_btn.clicked.connect(self.arm_clicked)
+        self.arm_btn.setEnabled(False)
+        arm_layout.addWidget(self.arm_btn)
+        self.disarm_btn = QPushButton("DISARM")
+        self.disarm_btn.setMinimumHeight(48)
+        self.disarm_btn.setStyleSheet("""
+            QPushButton { background:#c0392b; font-size:15px; }
+            QPushButton:hover { background:white; color:#c0392b; border:2px solid #c0392b; }
+            QPushButton:disabled { background:#444; color:#888; }""")
+        self.disarm_btn.clicked.connect(self.disarm_clicked)
+        self.disarm_btn.setEnabled(False)
+        arm_layout.addWidget(self.disarm_btn)
+        layout.addWidget(arm_group)
+
+        # Mod butonları
+        modes_group = QGroupBox("Mod Sec ve Degistir")
+        modes_layout = QVBoxLayout(modes_group)
+        row = None
+        for i, (mode, color, tooltip) in enumerate(self.MODES):
+            if i % 2 == 0:
+                row = QHBoxLayout()
+                modes_layout.addLayout(row)
+            btn = QPushButton(mode)
+            btn.setToolTip(tooltip)
+            btn.setMinimumHeight(44)
+            btn.setStyleSheet(f"""
+                QPushButton {{ background:{color}; font-size:13px; }}
+                QPushButton:hover {{ background:white; color:{color}; border:2px solid {color}; }}
+                QPushButton:disabled {{ background:#444; color:#888; }}""")
+            btn.clicked.connect(lambda checked, m=mode: self.set_mode_clicked(m))
+            btn.setEnabled(False)
+            self.mode_buttons_dict[mode] = btn
+            row.addWidget(btn)
+
+        custom_row = QHBoxLayout()
+        self.custom_mode_input = QComboBox()
+        self.custom_mode_input.setEditable(True)
+        self.custom_mode_input.addItems([m[0] for m in self.MODES] + self.EXTRA_MODES)
+        self.custom_mode_input.setStyleSheet(
+            "background:#16213e; color:white; border:1px solid #0f3460;"
+            "border-radius:5px; padding:5px; font-size:13px;")
+        self.custom_apply_btn = QPushButton("Ozel Mod Uygula")
+        self.custom_apply_btn.setStyleSheet("background:#0f3460;")
+        self.custom_apply_btn.clicked.connect(
+            lambda: self.set_mode_clicked(
+                self.custom_mode_input.currentText().upper().strip()))
+        self.custom_apply_btn.setEnabled(False)
+        custom_row.addWidget(QLabel("Ozel:"))
+        custom_row.addWidget(self.custom_mode_input)
+        custom_row.addWidget(self.custom_apply_btn)
+        modes_layout.addLayout(custom_row)
+        layout.addWidget(modes_group)
+
+        return panel
+
+    def _init_ui(self):
+        self.setWindowTitle("IHA Ucus Modu Kontrolu")
+        self.setMinimumSize(1280, 720)
+        self.setStyleSheet("""
+            QMainWindow { background-color: #1a1a2e; }
+            QWidget     { background-color: #1a1a2e; color: #eee; font-family: Arial; }
+            QGroupBox {
+                border: 2px solid #16213e; border-radius: 8px;
+                margin-top: 10px; padding: 10px;
+                font-size: 13px; font-weight: bold; color: #a0c4ff;
+            }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; }
+            QLineEdit {
+                background: #16213e; border: 1px solid #0f3460;
+                border-radius: 5px; padding: 6px; color: white; font-size: 13px;
+            }
+            QPushButton {
+                border-radius: 6px; padding: 8px 14px;
+                font-size: 13px; font-weight: bold; color: white;
+            }
+            QStatusBar { background: #16213e; color: #a0c4ff; }
+            QSplitter::handle { background: #0f3460; }
+        """)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QHBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ── QSplitter: sol kontrol | sağ MP harita yansıması ──────────────
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setHandleWidth(3)
+        splitter.setChildrenCollapsible(False)
+
+        # Sol: kaydırılabilir orijinal panel
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setStyleSheet(
+            "QScrollArea{border:none;background:#1a1a2e;}"
+            "QScrollBar:vertical{width:7px;background:#1a1a2e;}"
+            "QScrollBar::handle:vertical{background:#0f3460;border-radius:3px;}"
+            "QScrollBar:horizontal{height:7px;background:#1a1a2e;}"
+            "QScrollBar::handle:horizontal{background:#0f3460;border-radius:3px;}")
+        left = self._build_left_panel()
+        scroll.setWidget(left)
+        scroll.setMinimumWidth(820)
+
+        # Sağ: Mission Planner ekran yansıması
+        self.map_widget = MissionPlannerMapWidget()
+
+        splitter.addWidget(scroll)
+        splitter.addWidget(self.map_widget)
+        splitter.setSizes([860, 800])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+
+        root.addWidget(splitter)
+
+        # Status bar
+        self.status_bar = self.statusBar()
+        self.status_bar.showMessage("Bagli degil.")
+        self.hb_label = QLabel("Sinyal yok")
+        self.hb_label.setStyleSheet("color:#888; padding-right:10px;")
+        self.status_bar.addPermanentWidget(self.hb_label)
+
+        self.hb_timer = QTimer()
+        self.hb_timer.timeout.connect(self._check_heartbeat)
+        self.hb_timer.start(2000)
+
+        self.cleanup_timer = QTimer()
+        self.cleanup_timer.timeout.connect(self._cleanup_threads)
+        self.cleanup_timer.start(3000)
+
+    # ── Bağlantı ───────────────────────────────────────────────────────────
+    def connect_clicked(self):
+        conn_str = self.conn_input.text().strip()
+        self.status_bar.showMessage("Baglaniliyor...")
+        self.connect_btn.setEnabled(False)
+        self.conn_thread = ConnectThread(self.mav, conn_str)
+        self.conn_thread.result.connect(self._on_connect_result)
+        self.conn_thread.start()
+
+    def _on_connect_result(self, ok, msg):
+        self.status_bar.showMessage(msg)
+        if ok:
+            self.disconnect_btn.setEnabled(True)
+            for btn in self.mode_buttons_dict.values():
+                btn.setEnabled(True)
+            self.custom_apply_btn.setEnabled(True)
+            self.arm_btn.setEnabled(True)
+            self.disarm_btn.setEnabled(True)
+        else:
+            self.connect_btn.setEnabled(True)
+            QMessageBox.critical(self, "Baglanti Hatasi", msg)
+
+    def disconnect_clicked(self):
+        self.mav.disconnect()
+        self.connect_btn.setEnabled(True)
+        self.disconnect_btn.setEnabled(False)
+        for btn in self.mode_buttons_dict.values():
+            btn.setEnabled(False)
+        self.custom_apply_btn.setEnabled(False)
+        self.arm_btn.setEnabled(False)
+        self.disarm_btn.setEnabled(False)
+        self.current_mode_label.setText("---")
+        self.status_bar.showMessage("Baglanti kesildi.")
+        self.hb_label.setText("Sinyal yok")
+        self.hb_label.setStyleSheet("color:#888; padding-right:10px;")
+
+    def set_mode_clicked(self, mode):
+        if not mode:
+            return
+        self.status_bar.showMessage(f"Mod degistiriliyor: {mode}...")
+        t = SetModeThread(self.mav, mode)
+        t.result.connect(self._on_set_mode_result)
+        t.start()
+        self._threads.append(t)
+
+    def _on_set_mode_result(self, ok, msg):
+        self.status_bar.showMessage(msg)
+        if not ok:
+            QMessageBox.warning(self, "Mod Degistirme Hatasi", msg)
+
+    def arm_clicked(self):
+        if QMessageBox.question(self, "ARM Onayi",
+            "Ucagi ARM etmek istediginizden emin misiniz?",
+            QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+            t = ArmThread(self.mav)
+            t.result.connect(self._on_arm_result)
+            t.start()
+            self._threads.append(t)
+
+    def disarm_clicked(self):
+        if QMessageBox.question(self, "DISARM Onayi",
+            "Ucagi DISARM etmek istediginizden emin misiniz?",
+            QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+            t = DisarmThread(self.mav)
+            t.result.connect(self._on_arm_result)
+            t.start()
+            self._threads.append(t)
+
+    def _on_arm_result(self, ok, msg):
+        self.status_bar.showMessage(msg)
+        if not ok:
+            QMessageBox.warning(self, "Hata", msg)
+
+    def _update_mode_display(self, mode):
+        self.current_mode_label.setText(mode)
+        self.status_bar.showMessage(f"Aktif mod: {mode}")
+
+    def _update_telemetry_display(self, data):
+        self.airspeed_gauge.set_value(data['airspeed'])
+        self.altitude_gauge.set_value(data['altitude'])
+        self.attitude_widget.set_attitude(data['roll'], data['pitch'])
+        self.status_widget.set_data(
+            data['gps_satellites'], data['rssi'], data.get('rssi_active', False))
+
+        if data['armed']:
+            self.arm_status_label.setText("ARMED")
+            self.arm_status_label.setStyleSheet(
+                "color:#27ae60; background:#16213e; border-radius:8px;"
+                " padding:8px; font-weight:bold;")
+        else:
+            self.arm_status_label.setText("DISARMED")
+            self.arm_status_label.setStyleSheet(
+                "color:#e74c3c; background:#16213e; border-radius:8px;"
+                " padding:8px; font-weight:bold;")
+
+    def _check_heartbeat(self):
+        if self.mav.connected:
+            self.hb_label.setText("BAGLI")
+            self.hb_label.setStyleSheet("color:#2ecc71; padding-right:10px;")
+        else:
+            self.hb_label.setText("Sinyal yok")
+            self.hb_label.setStyleSheet("color:#888; padding-right:10px;")
+
+    def _cleanup_threads(self):
+        self._threads = [t for t in self._threads if t.isRunning()]
+
+    def closeEvent(self, event):
+        self.mav.disconnect()
+        for t in self._threads:
+            t.wait(2000)
+        event.accept()
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())

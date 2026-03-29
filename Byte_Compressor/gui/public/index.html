@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ByteCompressor — Deep Space Compression</title>
+<style>
+/* ── Reset & Base ── */
+*{margin:0;padding:0;box-sizing:border-box}
+body{
+  font-family:'Segoe UI',system-ui,-apple-system,sans-serif;
+  background:#0a0e17;
+  color:#e0e6f0;
+  min-height:100vh;
+  overflow-x:hidden;
+}
+
+/* ── Starfield background ── */
+body::before{
+  content:'';position:fixed;top:0;left:0;width:100%;height:100%;
+  background:radial-gradient(ellipse at 20% 50%,#0d1525 0%,#080c15 50%,#050810 100%);
+  z-index:-2;
+}
+
+/* ── Header ── */
+.header{
+  text-align:center;padding:28px 20px 18px;
+  border-bottom:1px solid rgba(100,180,255,0.12);
+  background:linear-gradient(180deg,rgba(15,25,50,0.9) 0%,transparent 100%);
+}
+.header h1{
+  font-size:28px;font-weight:300;letter-spacing:4px;
+  background:linear-gradient(135deg,#60a5fa,#a78bfa,#60a5fa);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+}
+.header .subtitle{font-size:12px;color:#607090;margin-top:4px;letter-spacing:2px;text-transform:uppercase}
+
+/* ── Layout ── */
+.container{max-width:1100px;margin:0 auto;padding:24px 20px}
+.panels{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:0}
+@media(max-width:800px){.panels{grid-template-columns:1fr}}
+
+/* ── Card ── */
+.card{
+  background:rgba(15,20,35,0.85);
+  border:1px solid rgba(100,160,255,0.1);
+  border-radius:12px;padding:20px;
+  backdrop-filter:blur(10px);
+}
+.card h2{
+  font-size:14px;font-weight:600;letter-spacing:1.5px;
+  text-transform:uppercase;color:#60a5fa;margin-bottom:16px;
+}
+
+/* ── Drop Zone ── */
+.dropzone{
+  border:2px dashed rgba(100,160,255,0.25);
+  border-radius:12px;padding:48px 24px;text-align:center;
+  cursor:pointer;transition:all .3s;
+  background:rgba(15,25,50,0.3);
+  margin-bottom:20px;position:relative;overflow:hidden;
+}
+.dropzone:hover,.dropzone.dragover{
+  border-color:#60a5fa;background:rgba(30,50,90,0.3);
+  box-shadow:0 0 30px rgba(96,165,250,0.08);
+}
+.dropzone .icon{font-size:48px;margin-bottom:12px;opacity:0.5}
+.dropzone p{color:#607898;font-size:14px}
+.dropzone .filename{
+  color:#a78bfa;font-size:16px;font-weight:600;margin-top:8px;
+  word-break:break-all;
+}
+.dropzone .fileinfo{color:#607898;font-size:12px;margin-top:4px}
+input[type="file"]{display:none}
+
+/* ── Buttons ── */
+.actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:20px}
+.btn{
+  padding:12px 16px;border:1px solid rgba(100,160,255,0.2);
+  border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;
+  letter-spacing:0.5px;transition:all .25s;
+  background:rgba(20,30,55,0.8);color:#c0d0e8;
+  display:flex;align-items:center;justify-content:center;gap:8px;
+}
+.btn:hover:not(:disabled){
+  background:rgba(40,60,100,0.8);border-color:#60a5fa;
+  box-shadow:0 0 15px rgba(96,165,250,0.15);transform:translateY(-1px);
+}
+.btn:disabled{opacity:0.35;cursor:not-allowed}
+.btn.primary{background:linear-gradient(135deg,#1d4ed8,#6d28d9);border-color:#4f46e5;color:#fff}
+.btn.primary:hover:not(:disabled){background:linear-gradient(135deg,#2563eb,#7c3aed);box-shadow:0 0 20px rgba(99,102,241,0.3)}
+.btn.danger{border-color:rgba(239,68,68,0.3);color:#fca5a5}
+.btn.danger:hover:not(:disabled){background:rgba(127,29,29,0.5);border-color:#ef4444}
+
+/* ── Profile selector ── */
+.profile-select{
+  width:100%;padding:10px 12px;background:rgba(15,20,35,0.9);
+  border:1px solid rgba(100,160,255,0.15);border-radius:8px;
+  color:#c0d0e8;font-size:13px;margin-bottom:16px;
+  cursor:pointer;
+}
+.profile-select option{background:#0f1423;color:#c0d0e8}
+
+/* ── Animation area ── */
+.anim-container{
+  height:140px;border-radius:10px;overflow:hidden;
+  background:rgba(8,12,22,0.9);border:1px solid rgba(100,160,255,0.08);
+  position:relative;margin-bottom:20px;display:none;
+}
+.anim-container.active{display:block}
+
+.pipeline-visual{
+  display:flex;align-items:center;justify-content:space-between;
+  height:100%;padding:0 24px;position:relative;
+}
+
+/* Pipeline stages */
+.stage{
+  display:flex;flex-direction:column;align-items:center;
+  z-index:2;opacity:0;transform:scale(0.8);
+  transition:all .4s cubic-bezier(0.34,1.56,0.64,1);
+}
+.stage.visible{opacity:1;transform:scale(1)}
+.stage .stage-box{
+  width:70px;height:36px;border-radius:6px;
+  display:flex;align-items:center;justify-content:center;
+  font-size:10px;font-weight:700;letter-spacing:0.5px;
+  border:1px solid rgba(100,160,255,0.3);
+  background:rgba(20,40,80,0.6);
+}
+.stage .stage-label{font-size:9px;color:#507090;margin-top:4px}
+
+/* Flowing particles */
+.particles-layer{
+  position:absolute;top:0;left:0;width:100%;height:100%;
+  pointer-events:none;overflow:hidden;
+}
+.particle{
+  position:absolute;width:6px;height:6px;border-radius:50%;
+  background:#60a5fa;opacity:0;
+  animation:flowParticle var(--dur) linear forwards;
+  animation-delay:var(--delay);
+}
+@keyframes flowParticle{
+  0%{opacity:0;left:5%;transform:scale(var(--s0))}
+  10%{opacity:0.9}
+  50%{opacity:0.7;transform:scale(calc(var(--s0)*0.6))}
+  90%{opacity:0.4;transform:scale(calc(var(--s0)*0.3))}
+  100%{opacity:0;left:95%;transform:scale(0.1)}
+}
+
+/* Compression progress bar */
+.progress-track{
+  position:absolute;bottom:0;left:0;width:100%;height:4px;
+  background:rgba(100,160,255,0.08);
+}
+.progress-fill{
+  height:100%;width:0%;background:linear-gradient(90deg,#3b82f6,#a78bfa);
+  transition:width .3s;border-radius:0 2px 2px 0;
+}
+
+.anim-status{
+  position:absolute;bottom:10px;left:50%;transform:translateX(-50%);
+  font-size:11px;color:#60a5fa;letter-spacing:1px;
+}
+
+/* ── Results ── */
+.results{display:none}
+.results.show{display:block}
+
+.result-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.result-item{
+  background:rgba(10,15,30,0.6);border-radius:8px;padding:12px;
+  border:1px solid rgba(100,160,255,0.06);
+}
+.result-item .label{font-size:10px;color:#506880;text-transform:uppercase;letter-spacing:1px}
+.result-item .value{font-size:20px;font-weight:700;margin-top:2px;color:#c0d8f0}
+.result-item .value.highlight{
+  background:linear-gradient(135deg,#60a5fa,#a78bfa);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+}
+.result-item .unit{font-size:11px;color:#506880;font-weight:400}
+
+.download-btn{
+  margin-top:14px;width:100%;padding:14px;
+  background:linear-gradient(135deg,#059669,#0d9488);
+  border:none;border-radius:8px;color:#fff;font-size:14px;font-weight:700;
+  cursor:pointer;letter-spacing:0.5px;transition:all .2s;
+}
+.download-btn:hover{transform:translateY(-1px);box-shadow:0 4px 20px rgba(5,150,105,0.3)}
+
+/* ── Benchmark table ── */
+.bench-table{width:100%;border-collapse:collapse;font-size:12px;margin-top:10px}
+.bench-table th{
+  text-align:left;padding:8px;color:#60a5fa;font-weight:600;
+  border-bottom:1px solid rgba(100,160,255,0.15);font-size:11px;
+  text-transform:uppercase;letter-spacing:0.5px;
+}
+.bench-table td{
+  padding:7px 8px;border-bottom:1px solid rgba(100,160,255,0.05);
+}
+.bench-table tr:hover td{background:rgba(96,165,250,0.04)}
+.bench-table .bar-cell{width:140px}
+.bench-bar{
+  height:14px;border-radius:3px;
+  background:linear-gradient(90deg,#3b82f6,#8b5cf6);
+  transition:width .5s;
+}
+.bench-best{color:#34d399;font-weight:700}
+
+/* ── Analyze ── */
+.analyze-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+.analyze-item{
+  background:rgba(10,15,30,0.6);border-radius:8px;padding:10px;
+  border:1px solid rgba(100,160,255,0.06);text-align:center;
+}
+.analyze-item .val{font-size:18px;font-weight:700;color:#c0d8f0}
+.analyze-item .lbl{font-size:9px;color:#506880;text-transform:uppercase;letter-spacing:0.5px;margin-top:2px}
+
+.freq-chart{
+  display:flex;align-items:flex-end;gap:1px;height:60px;
+  margin-top:12px;padding:0 2px;
+}
+.freq-bar{
+  flex:1;min-width:2px;background:linear-gradient(0deg,#3b82f6,#60a5fa);
+  border-radius:1px 1px 0 0;transition:height .5s;
+}
+
+/* ── Spinner ── */
+.spinner{display:none;text-align:center;padding:30px}
+.spinner.show{display:block}
+.spinner .ring{
+  display:inline-block;width:36px;height:36px;
+  border:3px solid rgba(100,160,255,0.15);
+  border-top-color:#60a5fa;border-radius:50%;
+  animation:spin .8s linear infinite;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+.spinner p{margin-top:10px;color:#607898;font-size:12px}
+
+/* ── Toast ── */
+.toast{
+  position:fixed;bottom:24px;right:24px;
+  padding:14px 20px;border-radius:8px;font-size:13px;
+  background:#1e293b;border:1px solid rgba(100,160,255,0.15);
+  color:#e0e6f0;box-shadow:0 8px 30px rgba(0,0,0,0.4);
+  transform:translateY(100px);opacity:0;transition:all .3s;z-index:100;
+}
+.toast.show{transform:translateY(0);opacity:1}
+.toast.error{border-color:rgba(239,68,68,0.4);background:#1a0a0a}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>BYTECOMPRESSOR</h1>
+  <div class="subtitle">Deep Space Communication Data Compression System</div>
+</div>
+
+<div class="container">
+
+  <!-- Drop Zone -->
+  <div class="dropzone" id="dropzone" onclick="document.getElementById('fileInput').click()">
+    <div class="icon" id="dropIcon">&#128752;</div>
+    <p id="dropText">Dosyayı buraya sürükleyin veya tıklayarak seçin</p>
+    <div class="filename" id="fileName" style="display:none"></div>
+    <div class="fileinfo" id="fileInfo" style="display:none"></div>
+  </div>
+  <input type="file" id="fileInput">
+
+  <!-- Animation Area -->
+  <div class="anim-container" id="animContainer">
+    <div class="pipeline-visual" id="pipelineVisual"></div>
+    <div class="particles-layer" id="particlesLayer"></div>
+    <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+    <div class="anim-status" id="animStatus"></div>
+  </div>
+
+  <div class="panels">
+    <!-- Left Panel: Controls -->
+    <div class="card">
+      <h2>İşlemler</h2>
+
+      <select class="profile-select" id="profileSelect">
+        <option value="auto">Otomatik Profil Seçimi</option>
+        <option value="0">GENERIC — BWT+MTF+RLE+ANS</option>
+        <option value="1">TELEMETRY — Delta+RLE+ANS</option>
+        <option value="2">IMAGE — Delta+BWT+MTF+ANS</option>
+        <option value="3">RAW_ANS — Sadece ANS</option>
+        <option value="4">LZ77+ANS — Genel Amaçlı</option>
+        <option value="5">LZ77+TEXT — Metin/Kod</option>
+        <option value="6">LZ77+BIN — İkili Yapı</option>
+      </select>
+
+      <div class="actions">
+        <button class="btn primary" id="btnCompress" disabled onclick="doCompress()">
+          <span>&#9660;</span> SIKIŞTIR
+        </button>
+        <button class="btn primary" id="btnDecompress" disabled onclick="doDecompress()">
+          <span>&#9650;</span> ÇIKAR
+        </button>
+        <button class="btn" id="btnAnalyze" disabled onclick="doAnalyze()">
+          <span>&#128270;</span> ANALIZ ET
+        </button>
+        <button class="btn" id="btnBenchmark" disabled onclick="doBenchmark()">
+          <span>&#9881;</span> BENCHMARK
+        </button>
+      </div>
+
+      <!-- Spinner -->
+      <div class="spinner" id="spinner">
+        <div class="ring"></div>
+        <p id="spinnerText">İşleniyor...</p>
+      </div>
+
+      <!-- Compress/Decompress Result -->
+      <div class="results" id="compressResult">
+        <div class="result-grid">
+          <div class="result-item">
+            <div class="label">Orijinal Boyut</div>
+            <div class="value" id="resOriginal">—</div>
+          </div>
+          <div class="result-item">
+            <div class="label">Sıkıştırılmış</div>
+            <div class="value highlight" id="resCompressed">—</div>
+          </div>
+          <div class="result-item">
+            <div class="label">Sıkıştırma Oranı</div>
+            <div class="value highlight" id="resRatio">—</div>
+          </div>
+          <div class="result-item">
+            <div class="label">Alan Tasarrufu</div>
+            <div class="value" id="resSaving">—</div>
+          </div>
+          <div class="result-item">
+            <div class="label">Shannon Verimliliği</div>
+            <div class="value" id="resShannon">—</div>
+          </div>
+          <div class="result-item">
+            <div class="label">Profil</div>
+            <div class="value" id="resProfile" style="font-size:13px">—</div>
+          </div>
+        </div>
+        <button class="download-btn" id="downloadBtn" onclick="doDownload()">Dosyayı İndir</button>
+      </div>
+    </div>
+
+    <!-- Right Panel: Analyze / Benchmark -->
+    <div class="card">
+      <h2 id="rightTitle">Analiz & Benchmark</h2>
+
+      <div id="analyzeResult" style="display:none">
+        <div class="analyze-grid">
+          <div class="analyze-item"><div class="val" id="anEntropy">—</div><div class="lbl">Entropi (bit/sym)</div></div>
+          <div class="analyze-item"><div class="val" id="anTheoMin">—</div><div class="lbl">Teorik Min</div></div>
+          <div class="analyze-item"><div class="val" id="anMaxComp">—</div><div class="lbl">Max Oran</div></div>
+          <div class="analyze-item"><div class="val" id="anUnique">—</div><div class="lbl">Benzersiz Byte</div></div>
+          <div class="analyze-item"><div class="val" id="anMostCommon">—</div><div class="lbl">En Sık Byte</div></div>
+          <div class="analyze-item"><div class="val" id="anProfile">—</div><div class="lbl">Önerilen Profil</div></div>
+        </div>
+        <div style="margin-top:14px;font-size:11px;color:#506880;text-transform:uppercase;letter-spacing:1px">Byte Frekans Dağılımı</div>
+        <div class="freq-chart" id="freqChart"></div>
+      </div>
+
+      <div id="benchmarkResult" style="display:none">
+        <div style="margin-bottom:8px;font-size:12px;color:#607898" id="benchInfo"></div>
+        <table class="bench-table">
+          <thead><tr><th>Profil</th><th>Boyut</th><th>Oran</th><th class="bar-cell">Performans</th><th>Doğrulama</th></tr></thead>
+          <tbody id="benchBody"></tbody>
+        </table>
+      </div>
+
+      <div id="rightPlaceholder" style="text-align:center;padding:40px 20px;color:#405060">
+        <div style="font-size:36px;opacity:0.3;margin-bottom:10px">&#128640;</div>
+        <p style="font-size:13px">Dosya yükleyip <b>Analiz</b> veya <b>Benchmark</b> butonuna basın</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script>
+/* ── State ── */
+let currentFile = null;
+let currentData = null;
+let downloadInfo = null;
+
+/* ── Elements ── */
+const $ = id => document.getElementById(id);
+const dropzone = $('dropzone');
+const fileInput = $('fileInput');
+const buttons = ['btnCompress','btnDecompress','btnAnalyze','btnBenchmark'];
+
+/* ── File handling ── */
+fileInput.addEventListener('change', e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
+
+dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('dragover'); });
+dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+dropzone.addEventListener('drop', e => {
+    e.preventDefault(); dropzone.classList.remove('dragover');
+    if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
+});
+
+function loadFile(file) {
+    currentFile = file;
+    $('dropIcon').textContent = '\u{1F4C4}';
+    $('dropText').style.display = 'none';
+    $('fileName').textContent = file.name;
+    $('fileName').style.display = 'block';
+    $('fileInfo').textContent = formatSize(file.size) + ' — ' + (file.type || 'binary');
+    $('fileInfo').style.display = 'block';
+    buttons.forEach(b => $(b).disabled = false);
+
+    // Read file
+    const reader = new FileReader();
+    reader.onload = () => { currentData = new Uint8Array(reader.result); };
+    reader.readAsArrayBuffer(file);
+
+    // Reset results
+    hideResults();
+}
+
+function formatSize(bytes) {
+    if (bytes < 1024) return bytes + ' byte';
+    if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' KB';
+    return (bytes/1024/1024).toFixed(2) + ' MB';
+}
+
+/* ── Animation ── */
+const PIPELINE_STAGES = {
+    4: ['LZ77','ANS'],          // LZ77_ANS
+    5: ['LZ77','ANS'],          // LZ77_TEXT
+    6: ['LZ77','ANS'],          // LZ77_BIN
+    0: ['BWT','MTF','RLE','ANS'],  // GENERIC
+    1: ['Delta','RLE','ANS'],      // TELEMETRY
+    2: ['Delta','BWT','MTF','ANS'],// IMAGE
+    3: ['ANS'],                    // RAW_ANS
+};
+
+function showAnimation(profile, mode) {
+    const container = $('animContainer');
+    container.classList.add('active');
+
+    const stages = PIPELINE_STAGES[profile] || ['ANS'];
+    const label = mode === 'compress' ? 'SIKIŞTIRMA' : 'ÇIKARMA';
+
+    // Build pipeline visual
+    const pv = $('pipelineVisual');
+    pv.innerHTML = '';
+
+    // Input
+    const inp = document.createElement('div');
+    inp.className = 'stage visible';
+    inp.innerHTML = `<div class="stage-box" style="border-color:rgba(52,211,153,0.5);background:rgba(16,65,60,0.6)">GİRDİ</div>`;
+    pv.appendChild(inp);
+
+    // Stages (animate in sequence)
+    const stageList = mode === 'compress' ? stages : [...stages].reverse();
+    stageList.forEach((s, i) => {
+        const el = document.createElement('div');
+        el.className = 'stage';
+        const colors = ['#3b82f6','#8b5cf6','#ec4899','#f59e0b','#10b981'];
+        const c = colors[i % colors.length];
+        el.innerHTML = `<div class="stage-box" style="border-color:${c}55;color:${c}">${s}</div><div class="stage-label">Adım ${i+1}</div>`;
+        pv.appendChild(el);
+        setTimeout(() => el.classList.add('visible'), 200 + i * 300);
+    });
+
+    // Output
+    const outp = document.createElement('div');
+    outp.className = 'stage';
+    outp.innerHTML = `<div class="stage-box" style="border-color:rgba(168,85,247,0.5);background:rgba(88,28,135,0.4)">ÇIKTI</div>`;
+    pv.appendChild(outp);
+    setTimeout(() => outp.classList.add('visible'), 200 + stageList.length * 300);
+
+    // Particles
+    const pl = $('particlesLayer');
+    pl.innerHTML = '';
+    const pCount = 25;
+    for (let i = 0; i < pCount; i++) {
+        const p = document.createElement('div');
+        p.className = 'particle';
+        const y = 20 + Math.random() * 100;
+        const size = 0.5 + Math.random() * 1.5;
+        const dur = 1.5 + Math.random() * 1;
+        const delay = i * 0.12;
+        const hue = mode === 'compress' ? `hsl(${220 + Math.random()*40}, 80%, 65%)` : `hsl(${140 + Math.random()*40}, 70%, 55%)`;
+        p.style.cssText = `top:${y}px;--dur:${dur}s;--delay:${delay}s;--s0:${size};background:${hue}`;
+        pl.appendChild(p);
+    }
+
+    $('animStatus').textContent = label;
+    $('progressFill').style.width = '0%';
+
+    return { container, stageCount: stageList.length };
+}
+
+function animateProgress(duration) {
+    const fill = $('progressFill');
+    let start = Date.now();
+    function tick() {
+        const pct = Math.min(100, ((Date.now() - start) / duration) * 100);
+        fill.style.width = pct + '%';
+        if (pct < 100) requestAnimationFrame(tick);
+    }
+    tick();
+}
+
+function hideAnimation() {
+    setTimeout(() => {
+        $('animContainer').classList.remove('active');
+    }, 1500);
+}
+
+/* ── API calls ── */
+function showSpinner(text) {
+    $('spinner').classList.add('show');
+    $('spinnerText').textContent = text;
+}
+function hideSpinner() { $('spinner').classList.remove('show'); }
+
+function showToast(msg, isError) {
+    const t = $('toast');
+    t.textContent = msg;
+    t.className = 'toast show' + (isError ? ' error' : '');
+    setTimeout(() => t.className = 'toast', 3500);
+}
+
+function hideResults() {
+    $('compressResult').classList.remove('show');
+    $('analyzeResult').style.display = 'none';
+    $('benchmarkResult').style.display = 'none';
+    $('rightPlaceholder').style.display = 'block';
+    downloadInfo = null;
+}
+
+async function doCompress() {
+    if (!currentData) return;
+    hideResults();
+
+    const profile = $('profileSelect').value;
+    const anim = showAnimation(profile === 'auto' ? 4 : parseInt(profile), 'compress');
+    showSpinner('Sıkıştırılıyor...');
+    animateProgress(2000);
+
+    try {
+        const res = await fetch('/api/compress', {
+            method: 'POST',
+            headers: { 'X-Profile': profile, 'X-Filename': currentFile.name },
+            body: currentData,
+        });
+        const data = await res.json();
+        hideSpinner();
+
+        if (data.error) { showToast(data.error, true); hideAnimation(); return; }
+
+        $('progressFill').style.width = '100%';
+        $('animStatus').textContent = 'TAMAMLANDI — ' + data.compressionRatio.toFixed(2) + 'x';
+
+        $('resOriginal').innerHTML = formatSize(data.originalSize);
+        $('resCompressed').innerHTML = formatSize(data.compressedSize);
+        $('resRatio').innerHTML = data.compressionRatio.toFixed(2) + '<span class="unit">x</span>';
+        $('resSaving').innerHTML = data.spaceSaving.toFixed(1) + '<span class="unit">%</span>';
+        $('resShannon').innerHTML = data.shannonEfficiency.toFixed(1) + '<span class="unit">%</span>';
+        $('resProfile').textContent = data.profileName;
+
+        downloadInfo = { id: data.id, filename: data.filename };
+        $('downloadBtn').textContent = 'İndir — ' + data.filename;
+        $('compressResult').classList.add('show');
+
+        showToast('Sıkıştırma tamamlandı: ' + data.compressionRatio.toFixed(2) + 'x');
+        setTimeout(hideAnimation, 2000);
+
+    } catch(e) {
+        hideSpinner(); hideAnimation();
+        showToast('Hata: ' + e.message, true);
+    }
+}
+
+async function doDecompress() {
+    if (!currentData) return;
+    hideResults();
+
+    const anim = showAnimation(3, 'decompress');
+    showSpinner('Çıkartılıyor...');
+    animateProgress(2000);
+
+    try {
+        const res = await fetch('/api/decompress', {
+            method: 'POST',
+            headers: { 'X-Filename': currentFile.name },
+            body: currentData,
+        });
+        const data = await res.json();
+        hideSpinner();
+
+        if (data.error) { showToast(data.error, true); hideAnimation(); return; }
+
+        $('progressFill').style.width = '100%';
+        $('animStatus').textContent = 'ÇIKARILDI — ' + formatSize(data.originalSize);
+
+        $('resOriginal').innerHTML = formatSize(data.originalSize) + ' <span class="unit">(açılmış)</span>';
+        $('resCompressed').innerHTML = formatSize(data.compressedSize) + ' <span class="unit">(sıkışık)</span>';
+        $('resRatio').innerHTML = data.compressionRatio.toFixed(2) + '<span class="unit">x</span>';
+        $('resSaving').innerHTML = data.spaceSaving.toFixed(1) + '<span class="unit">%</span>';
+        $('resShannon').innerHTML = data.shannonEfficiency.toFixed(1) + '<span class="unit">%</span>';
+        $('resProfile').textContent = 'Doğrulandı (CRC32 OK)';
+
+        downloadInfo = { id: data.id, filename: data.filename };
+        $('downloadBtn').textContent = 'İndir — ' + data.filename;
+        $('compressResult').classList.add('show');
+
+        showToast('Dosya başarıyla çıkarıldı');
+        setTimeout(hideAnimation, 2000);
+
+    } catch(e) {
+        hideSpinner(); hideAnimation();
+        showToast('Hata: ' + e.message, true);
+    }
+}
+
+async function doAnalyze() {
+    if (!currentData) return;
+    $('rightPlaceholder').style.display = 'none';
+    $('benchmarkResult').style.display = 'none';
+    $('analyzeResult').style.display = 'none';
+    $('rightTitle').textContent = 'Dosya Analizi';
+    showSpinner('Analiz ediliyor...');
+
+    try {
+        const res = await fetch('/api/analyze', { method: 'POST', body: currentData });
+        const data = await res.json();
+        hideSpinner();
+
+        $('anEntropy').textContent = data.entropy.toFixed(3);
+        $('anTheoMin').textContent = formatSize(Math.ceil(data.theoreticalMin));
+        $('anMaxComp').textContent = data.maxCompression.toFixed(1) + 'x';
+        $('anUnique').textContent = data.uniqueBytes + '/256';
+        $('anMostCommon').textContent = '0x' + data.mostCommonByte.toString(16).toUpperCase().padStart(2,'0');
+        $('anProfile').textContent = data.recommendedProfileName.split('(')[0].trim();
+
+        // Freq chart
+        const chart = $('freqChart');
+        chart.innerHTML = '';
+        const maxCount = data.topBytes.length > 0 ? data.topBytes[0].count : 1;
+        // Build full 256-byte histogram
+        const freqMap = {};
+        data.topBytes.forEach(b => freqMap[b.byte] = b.count);
+        for (let i = 0; i < 256; i++) {
+            const bar = document.createElement('div');
+            bar.className = 'freq-bar';
+            const h = freqMap[i] ? Math.max(2, (freqMap[i] / maxCount) * 58) : 0;
+            bar.style.height = h + 'px';
+            if (h === 0) bar.style.background = 'rgba(30,50,80,0.3)';
+            chart.appendChild(bar);
+        }
+
+        $('analyzeResult').style.display = 'block';
+        showToast('Analiz tamamlandı — Entropi: ' + data.entropy.toFixed(3) + ' bit/sym');
+
+    } catch(e) {
+        hideSpinner();
+        showToast('Hata: ' + e.message, true);
+    }
+}
+
+async function doBenchmark() {
+    if (!currentData) return;
+    $('rightPlaceholder').style.display = 'none';
+    $('analyzeResult').style.display = 'none';
+    $('benchmarkResult').style.display = 'none';
+    $('rightTitle').textContent = 'Benchmark';
+    showSpinner('Tüm profiller test ediliyor...');
+
+    try {
+        const res = await fetch('/api/benchmark', { method: 'POST', body: currentData });
+        const data = await res.json();
+        hideSpinner();
+
+        $('benchInfo').textContent = `Orijinal: ${formatSize(data.originalSize)} | Entropi: ${data.entropy.toFixed(3)} bit/sym | Teorik min: ${formatSize(Math.ceil(data.theoreticalMin))}`;
+
+        const tbody = $('benchBody');
+        tbody.innerHTML = '';
+
+        const maxRatio = Math.max(...data.profiles.map(p => p.compressionRatio));
+        const bestIdx = data.profiles.reduce((bi, p, i) => p.compressionRatio > data.profiles[bi].compressionRatio ? i : bi, 0);
+
+        data.profiles.forEach((p, i) => {
+            const tr = document.createElement('tr');
+            const isBest = i === bestIdx;
+            const barW = maxRatio > 0 ? (p.compressionRatio / maxRatio * 100) : 0;
+            tr.innerHTML = `
+                <td style="font-size:11px;${isBest ? 'color:#34d399;font-weight:700' : ''}">${p.profileName.split('(')[0].trim()}</td>
+                <td>${formatSize(p.compressedSize)}</td>
+                <td class="${isBest ? 'bench-best' : ''}">${p.compressionRatio.toFixed(2)}x</td>
+                <td class="bar-cell"><div class="bench-bar" style="width:${barW}%"></div></td>
+                <td style="color:${p.verified ? '#34d399' : '#ef4444'}">${p.verified ? 'OK' : 'FAIL'}</td>
+            `;
+            tbody.appendChild(tr);
+        });
+
+        $('benchmarkResult').style.display = 'block';
+        showToast('Benchmark tamamlandı — En iyi: ' + data.profiles[bestIdx].profileName.split('(')[0].trim());
+
+    } catch(e) {
+        hideSpinner();
+        showToast('Hata: ' + e.message, true);
+    }
+}
+
+function doDownload() {
+    if (!downloadInfo) return;
+    window.location.href = `/api/download?id=${downloadInfo.id}&filename=${encodeURIComponent(downloadInfo.filename)}`;
+}
+
+// Heartbeat: tarayıcı açık olduğu sürece sunucuya ping at
+setInterval(() => fetch('/api/ping').catch(() => {}), 5000);
+</script>
+</body>
+</html>
